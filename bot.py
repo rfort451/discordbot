@@ -73,6 +73,8 @@ async def init_db():
                 (guild_id BIGINT PRIMARY KEY, welcome_channel_id BIGINT, minigame_channel_id BIGINT, gambling_channel_id BIGINT, reaction_channel_id BIGINT, reaction_emotes TEXT)""")
             await conn.execute("""CREATE TABLE IF NOT EXISTS custom_commands 
                 (guild_id BIGINT, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS daily_claims 
+                (guild_id BIGINT, user_id BIGINT, last_claim TIMESTAMP, PRIMARY KEY (guild_id, user_id))""")
     else:
         print("📦 Using SQLite (local)")
         async with aiosqlite.connect("bot.db") as db:
@@ -86,6 +88,8 @@ async def init_db():
                 (guild_id INTEGER PRIMARY KEY, welcome_channel_id INTEGER, minigame_channel_id INTEGER, gambling_channel_id INTEGER, reaction_channel_id INTEGER, reaction_emotes TEXT)""")
             await db.execute("""CREATE TABLE IF NOT EXISTS custom_commands 
                 (guild_id INTEGER, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS daily_claims 
+                (guild_id INTEGER, user_id INTEGER, last_claim TIMESTAMP, PRIMARY KEY (guild_id, user_id))""")
             await db.commit()
 
 # ==================== HELPERS ====================
@@ -299,6 +303,31 @@ async def set_coins(guild_id, user_id, amount):
             await db.execute("INSERT OR REPLACE INTO user_coins VALUES (?,?,?)", (guild_id, user_id, amount))
             await db.commit()
 
+async def get_daily_claim(guild_id, user_id):
+    """Get last daily claim time, returns datetime or None"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT last_claim FROM daily_claims WHERE guild_id=$1 AND user_id=$2", guild_id, user_id)
+            return row['last_claim'] if row else None
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT last_claim FROM daily_claims WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+            row = await cur.fetchone()
+            if row and row[0]:
+                return datetime.fromisoformat(row[0])
+            return None
+
+async def set_daily_claim(guild_id, user_id):
+    """Set daily claim time to now"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO daily_claims (guild_id, user_id, last_claim) VALUES ($1, $2, NOW())
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET last_claim = NOW()""", guild_id, user_id)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT OR REPLACE INTO daily_claims VALUES (?,?,datetime('now'))", (guild_id, user_id))
+            await db.commit()
+
 def is_admin(member):
     return member.guild_permissions.manage_guild or member.guild_permissions.administrator
 
@@ -405,7 +434,7 @@ async def help(ctx):
     user_embed = discord.Embed(title="📚 Commands", color=discord.Color.blue())
     user_embed.add_field(name="🎮 Fun", value="`!meme` `!dadjoke` `!jokeoftheday` `!dirtyjoke` `!8ball` `!quote` `!roast`", inline=False)
     user_embed.add_field(name="🎯 Games", value="`!minigame` `!quiz` `!stopquiz` `!pausequiz`", inline=False)
-    user_embed.add_field(name="💰 Economy", value="`!coins` `!gamble` `!slots` `!blackjack` `!coinflip` `!dice` `!roulette`", inline=False)
+    user_embed.add_field(name="💰 Economy", value="`!coins` `!daily` `!gamble` `!slots` `!blackjack` `!coinflip` `!dice` `!roulette`", inline=False)
     user_embed.add_field(name="🎲 More Games", value="`!treasurehunt` `!heist` `!crime` `!boss`", inline=False)
     user_embed.add_field(name="🛒 Shop", value="`!shop` `!buy` `!purchases`", inline=False)
     user_embed.add_field(name="👋 Greetings", value="`!gm` `!gn` `!ga` `!render`", inline=False)
@@ -647,6 +676,34 @@ async def coins(ctx, member: discord.Member = None):
     m = member or ctx.author
     c = await get_coins(ctx.guild.id, m.id)
     embed = discord.Embed(title="💰 Balance", description=f"{m.mention}: **{c:,}** coins", color=discord.Color.gold())
+    await ctx.reply(embed=embed)
+
+@bot.command()
+async def daily(ctx):
+    last_claim = await get_daily_claim(ctx.guild.id, ctx.author.id)
+    now = datetime.now()
+    
+    if last_claim:
+        # Handle timezone-naive comparison
+        if hasattr(last_claim, 'tzinfo') and last_claim.tzinfo:
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+        time_diff = now - last_claim
+        hours_left = 24 - (time_diff.total_seconds() / 3600)
+        
+        if hours_left > 0:
+            hours = int(hours_left)
+            mins = int((hours_left - hours) * 60)
+            return await ctx.reply(f"⏰ You already claimed today! Come back in **{hours}h {mins}m**")
+    
+    # Give random coins 10-50
+    amount = random.randint(10, 50)
+    new_balance = await add_coins(ctx.guild.id, ctx.author.id, amount)
+    await set_daily_claim(ctx.guild.id, ctx.author.id)
+    
+    embed = discord.Embed(title="🎁 Daily Reward!", color=discord.Color.green())
+    embed.description = f"You received **{amount}** coins!\nNew balance: **{new_balance:,}** coins"
+    embed.set_footer(text="Come back in 24 hours!")
     await ctx.reply(embed=embed)
 
 @bot.command()
