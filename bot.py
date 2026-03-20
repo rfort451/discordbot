@@ -1,6 +1,7 @@
 """
 Discord Bot - Single File, Clean Build
 All commands in ONE file to prevent ANY duplicates
+Uses PostgreSQL for Railway (persistent) or SQLite for local
 """
 import os
 import discord
@@ -15,6 +16,12 @@ from io import BytesIO
 from dotenv import load_dotenv
 
 try:
+    import asyncpg
+    HAS_ASYNCPG = True
+except:
+    HAS_ASYNCPG = False
+
+try:
     from PIL import Image, ImageDraw, ImageFont
     HAS_PIL = True
 except:
@@ -24,6 +31,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PREFIX = os.getenv("BOT_PREFIX", "!")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway PostgreSQL
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -39,6 +47,7 @@ boss_battles = {}
 last_attack = {}
 message_cooldowns = {}
 daily_render = {}
+db_pool = None  # PostgreSQL connection pool
 
 # Image directories
 BASE_PATH = os.path.join(os.path.dirname(__file__), "images")
@@ -46,19 +55,38 @@ for pool in ["gm", "gn", "ga", "render", "welcome"]:
     os.makedirs(os.path.join(BASE_PATH, pool), exist_ok=True)
 
 # ==================== DATABASE ====================
+USE_POSTGRES = bool(DATABASE_URL and HAS_ASYNCPG)
+
 async def init_db():
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS user_coins 
-            (guild_id INTEGER, user_id INTEGER, coins INTEGER DEFAULT 0, PRIMARY KEY (guild_id, user_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS shop_items 
-            (guild_id INTEGER, item_id INTEGER, name TEXT, price INTEGER, PRIMARY KEY (guild_id, item_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS shop_purchases 
-            (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, user_id INTEGER, item_name TEXT, price INTEGER, purchased_at TIMESTAMP)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS guild_settings 
-            (guild_id INTEGER PRIMARY KEY, welcome_channel_id INTEGER, minigame_channel_id INTEGER, gambling_channel_id INTEGER, reaction_channel_id INTEGER, reaction_emotes TEXT)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS custom_commands 
-            (guild_id INTEGER, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
-        await db.commit()
+    global db_pool
+    if USE_POSTGRES:
+        print("📦 Using PostgreSQL (persistent)")
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""CREATE TABLE IF NOT EXISTS user_coins 
+                (guild_id BIGINT, user_id BIGINT, coins INTEGER DEFAULT 0, PRIMARY KEY (guild_id, user_id))""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS shop_items 
+                (guild_id BIGINT, item_id INTEGER, name TEXT, price INTEGER, PRIMARY KEY (guild_id, item_id))""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS shop_purchases 
+                (id SERIAL PRIMARY KEY, guild_id BIGINT, user_id BIGINT, item_name TEXT, price INTEGER, purchased_at TIMESTAMP)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS guild_settings 
+                (guild_id BIGINT PRIMARY KEY, welcome_channel_id BIGINT, minigame_channel_id BIGINT, gambling_channel_id BIGINT, reaction_channel_id BIGINT, reaction_emotes TEXT)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS custom_commands 
+                (guild_id BIGINT, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
+    else:
+        print("📦 Using SQLite (local)")
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("""CREATE TABLE IF NOT EXISTS user_coins 
+                (guild_id INTEGER, user_id INTEGER, coins INTEGER DEFAULT 0, PRIMARY KEY (guild_id, user_id))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS shop_items 
+                (guild_id INTEGER, item_id INTEGER, name TEXT, price INTEGER, PRIMARY KEY (guild_id, item_id))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS shop_purchases 
+                (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, user_id INTEGER, item_name TEXT, price INTEGER, purchased_at TIMESTAMP)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS guild_settings 
+                (guild_id INTEGER PRIMARY KEY, welcome_channel_id INTEGER, minigame_channel_id INTEGER, gambling_channel_id INTEGER, reaction_channel_id INTEGER, reaction_emotes TEXT)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS custom_commands 
+                (guild_id INTEGER, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
+            await db.commit()
 
 # ==================== HELPERS ====================
 async def fetch_api(url):
@@ -72,33 +100,204 @@ async def fetch_api(url):
     return None
 
 async def get_coins(guild_id, user_id):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT coins FROM user_coins WHERE guild_id=? AND user_id=?", (guild_id, user_id))
-        row = await cur.fetchone()
-        return row[0] if row else 0
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT coins FROM user_coins WHERE guild_id=$1 AND user_id=$2", guild_id, user_id)
+            return row['coins'] if row else 0
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT coins FROM user_coins WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+            row = await cur.fetchone()
+            return row[0] if row else 0
 
 async def add_coins(guild_id, user_id, amount):
     current = await get_coins(guild_id, user_id)
     new = max(0, current + amount)
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute("INSERT OR REPLACE INTO user_coins VALUES (?,?,?)", (guild_id, user_id, new))
-        await db.commit()
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO user_coins (guild_id, user_id, coins) VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET coins = $3""", guild_id, user_id, new)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT OR REPLACE INTO user_coins VALUES (?,?,?)", (guild_id, user_id, new))
+            await db.commit()
     return new
 
 async def get_channel_setting(guild_id, setting):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute(f"SELECT {setting} FROM guild_settings WHERE guild_id=?", (guild_id,))
-        row = await cur.fetchone()
-        return row[0] if row else None
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(f"SELECT {setting} FROM guild_settings WHERE guild_id=$1", guild_id)
+            return row[setting] if row else None
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute(f"SELECT {setting} FROM guild_settings WHERE guild_id=?", (guild_id,))
+            row = await cur.fetchone()
+            return row[0] if row else None
 
 async def set_guild_setting(guild_id, setting, value):
     """Update a single guild setting without wiping others"""
-    async with aiosqlite.connect("bot.db") as db:
-        # First ensure the row exists
-        await db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
-        # Then update only the specific column
-        await db.execute(f"UPDATE guild_settings SET {setting}=? WHERE guild_id=?", (value, guild_id))
-        await db.commit()
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO guild_settings (guild_id) VALUES ($1) ON CONFLICT (guild_id) DO NOTHING", guild_id)
+            await conn.execute(f"UPDATE guild_settings SET {setting}=$1 WHERE guild_id=$2", value, guild_id)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
+            await db.execute(f"UPDATE guild_settings SET {setting}=? WHERE guild_id=?", (value, guild_id))
+            await db.commit()
+
+async def get_reaction_settings(guild_id):
+    """Get reaction channel and emotes for a guild"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT reaction_channel_id, reaction_emotes FROM guild_settings WHERE guild_id=$1", guild_id)
+            return (row['reaction_channel_id'], row['reaction_emotes']) if row else (None, None)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT reaction_channel_id, reaction_emotes FROM guild_settings WHERE guild_id=?", (guild_id,))
+            row = await cur.fetchone()
+            return (row[0], row[1]) if row else (None, None)
+
+async def get_custom_command(guild_id, name):
+    """Get a custom command response"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT response FROM custom_commands WHERE guild_id=$1 AND name=$2", guild_id, name)
+            return row['response'] if row else None
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT response FROM custom_commands WHERE guild_id=? AND name=?", (guild_id, name))
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+async def set_custom_command(guild_id, name, response):
+    """Add or update a custom command"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO custom_commands (guild_id, name, response) VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, name) DO UPDATE SET response = $3""", guild_id, name, response)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT OR REPLACE INTO custom_commands VALUES (?,?,?)", (guild_id, name, response))
+            await db.commit()
+
+async def delete_custom_command(guild_id, name):
+    """Delete a custom command, returns True if deleted"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM custom_commands WHERE guild_id=$1 AND name=$2", guild_id, name)
+            return "DELETE 1" in result
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("DELETE FROM custom_commands WHERE guild_id=? AND name=?", (guild_id, name))
+            await db.commit()
+            return cur.rowcount > 0
+
+async def get_custom_commands_list(guild_id):
+    """Get all custom command names for a guild"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT name FROM custom_commands WHERE guild_id=$1", guild_id)
+            return [row['name'] for row in rows]
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT name FROM custom_commands WHERE guild_id=?", (guild_id,))
+            rows = await cur.fetchall()
+            return [row[0] for row in rows]
+
+async def get_shop_items(guild_id):
+    """Get all shop items for a guild"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT item_id, name, price FROM shop_items WHERE guild_id=$1", guild_id)
+            return [(row['item_id'], row['name'], row['price']) for row in rows]
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT item_id, name, price FROM shop_items WHERE guild_id=?", (guild_id,))
+            return await cur.fetchall()
+
+async def get_shop_item(guild_id, item_id):
+    """Get a specific shop item"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT name, price FROM shop_items WHERE guild_id=$1 AND item_id=$2", guild_id, item_id)
+            return (row['name'], row['price']) if row else None
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT name, price FROM shop_items WHERE guild_id=? AND item_id=?", (guild_id, item_id))
+            return await cur.fetchone()
+
+async def add_shop_item(guild_id, name, price):
+    """Add a shop item, returns the new item_id"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT COALESCE(MAX(item_id), 0) + 1 as next_id FROM shop_items WHERE guild_id=$1", guild_id)
+            next_id = row['next_id']
+            await conn.execute("INSERT INTO shop_items VALUES ($1, $2, $3, $4)", guild_id, next_id, name, price)
+            return next_id
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT MAX(item_id) FROM shop_items WHERE guild_id=?", (guild_id,))
+            row = await cur.fetchone()
+            next_id = (row[0] or 0) + 1
+            await db.execute("INSERT INTO shop_items VALUES (?,?,?,?)", (guild_id, next_id, name, price))
+            await db.commit()
+            return next_id
+
+async def update_shop_item(guild_id, item_id, field, value):
+    """Update a shop item field (name or price)"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute(f"UPDATE shop_items SET {field}=$1 WHERE guild_id=$2 AND item_id=$3", value, guild_id, item_id)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute(f"UPDATE shop_items SET {field}=? WHERE guild_id=? AND item_id=?", (value, guild_id, item_id))
+            await db.commit()
+
+async def delete_shop_item(guild_id, item_id):
+    """Delete a shop item"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM shop_items WHERE guild_id=$1 AND item_id=$2", guild_id, item_id)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("DELETE FROM shop_items WHERE guild_id=? AND item_id=?", (guild_id, item_id))
+            await db.commit()
+
+async def add_purchase(guild_id, user_id, item_name, price):
+    """Record a purchase"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO shop_purchases (guild_id, user_id, item_name, price, purchased_at) VALUES ($1, $2, $3, $4, NOW())", 
+                guild_id, user_id, item_name, price)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT INTO shop_purchases VALUES (NULL,?,?,?,?,datetime('now'))", (guild_id, user_id, item_name, price))
+            await db.commit()
+
+async def get_purchases(guild_id, user_id, limit=10):
+    """Get recent purchases for a user"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT item_name, price FROM shop_purchases WHERE guild_id=$1 AND user_id=$2 ORDER BY purchased_at DESC LIMIT $3", 
+                guild_id, user_id, limit)
+            return [(row['item_name'], row['price']) for row in rows]
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT item_name, price FROM shop_purchases WHERE guild_id=? AND user_id=? ORDER BY purchased_at DESC LIMIT ?", 
+                (guild_id, user_id, limit))
+            return await cur.fetchall()
+
+async def set_coins(guild_id, user_id, amount):
+    """Set coins directly (for editcoins)"""
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""INSERT INTO user_coins (guild_id, user_id, coins) VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET coins = $3""", guild_id, user_id, amount)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT OR REPLACE INTO user_coins VALUES (?,?,?)", (guild_id, user_id, amount))
+            await db.commit()
 
 def is_admin(member):
     return member.guild_permissions.manage_guild or member.guild_permissions.administrator
@@ -145,11 +344,9 @@ async def on_command_error(ctx, error):
         # Check custom commands
         cmd = ctx.message.content[1:].split()[0].lower() if ctx.message.content.startswith("!") else None
         if cmd:
-            async with aiosqlite.connect("bot.db") as db:
-                cur = await db.execute("SELECT response FROM custom_commands WHERE guild_id=? AND name=?", (ctx.guild.id, cmd))
-                row = await cur.fetchone()
-            if row:
-                await ctx.send(row[0])
+            response = await get_custom_command(ctx.guild.id, cmd)
+            if response:
+                await ctx.send(response)
 
 @bot.event
 async def on_message(message):
@@ -160,11 +357,9 @@ async def on_message(message):
     if message.attachments:
         has_image = any(a.content_type and a.content_type.startswith("image/") for a in message.attachments)
         if has_image:
-            async with aiosqlite.connect("bot.db") as db:
-                cur = await db.execute("SELECT reaction_channel_id, reaction_emotes FROM guild_settings WHERE guild_id=?", (message.guild.id,))
-                row = await cur.fetchone()
-            if row and row[0] and row[1] and message.channel.id == row[0]:
-                emotes = row[1].split(",")
+            reaction_ch, reaction_emotes = await get_reaction_settings(message.guild.id)
+            if reaction_ch and reaction_emotes and message.channel.id == reaction_ch:
+                emotes = reaction_emotes.split(",")
                 for emote in emotes:
                     try:
                         await message.add_reaction(emote.strip())
@@ -221,7 +416,7 @@ async def help(ctx):
         admin_embed = discord.Embed(title="🔧 Admin Commands", color=discord.Color.red())
         admin_embed.add_field(name="⚔️ Mod", value="`!ban` `!kick` `!warn` `!mute` `!unmute` `!clear` `!modlogs`", inline=False)
         admin_embed.add_field(name="💵 Economy", value="`!editcoins` `!shopadd` `!editshop`", inline=False)
-        admin_embed.add_field(name="📍 Setup", value="`!thischannelwelcome` `!thischannelminigame` `!thischannelgamble`", inline=False)
+        admin_embed.add_field(name="📍 Setup", value="`!thischannelwelcome` `!thischannelminigame` `!thischannelgamble` `!thischannelreaction` `!editchannelreaction`", inline=False)
         admin_embed.add_field(name="🖼️ Images", value="`!gmimage` `!gmimagedelete` etc.", inline=False)
         admin_embed.add_field(name="⚙️ Custom", value="`!addcmd` `!delcmd` `!cmdlist`", inline=False)
         await ctx.send(embed=admin_embed)
@@ -461,9 +656,7 @@ async def editcoins(ctx, member: discord.Member, amount: str):
     if amount.startswith("+"): new = current + int(amount[1:])
     elif amount.startswith("-"): new = max(0, current - int(amount[1:]))
     else: new = int(amount)
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute("INSERT OR REPLACE INTO user_coins VALUES (?,?,?)", (ctx.guild.id, member.id, new))
-        await db.commit()
+    await set_coins(ctx.guild.id, member.id, new)
     await ctx.reply(f"✅ {member.mention}: {current:,} → {new:,}")
 
 @bot.command()
@@ -831,9 +1024,7 @@ async def boss(ctx):
 # ==================== SHOP ====================
 @bot.command()
 async def shop(ctx):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT item_id, name, price FROM shop_items WHERE guild_id=?", (ctx.guild.id,))
-        items = await cur.fetchall()
+    items = await get_shop_items(ctx.guild.id)
     if not items:
         return await ctx.reply("🏪 Shop empty! Admin: `!shopadd name price`")
     embed = discord.Embed(title="🏪 Shop", color=discord.Color.blue())
@@ -844,43 +1035,31 @@ async def shop(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def shopadd(ctx, name: str, price: int):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT MAX(item_id) FROM shop_items WHERE guild_id=?", (ctx.guild.id,))
-        row = await cur.fetchone()
-        next_id = (row[0] or 0) + 1
-        await db.execute("INSERT INTO shop_items VALUES (?,?,?,?)", (ctx.guild.id, next_id, name.replace("_"," "), price))
-        await db.commit()
+    next_id = await add_shop_item(ctx.guild.id, name.replace("_"," "), price)
     await ctx.reply(f"✅ Added #{next_id} {name} for {price:,}")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def editshop(ctx, item_id: int, action: str, value: str = None):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT name, price FROM shop_items WHERE guild_id=? AND item_id=?", (ctx.guild.id, item_id))
-        item = await cur.fetchone()
-        if not item:
-            return await ctx.reply("❌ Item not found!")
-        action = action.lower()
-        if action == "delete":
-            await db.execute("DELETE FROM shop_items WHERE guild_id=? AND item_id=?", (ctx.guild.id, item_id))
-            await db.commit()
-            await ctx.reply(f"✅ Deleted #{item_id}")
-        elif action == "price" and value:
-            await db.execute("UPDATE shop_items SET price=? WHERE guild_id=? AND item_id=?", (int(value), ctx.guild.id, item_id))
-            await db.commit()
-            await ctx.reply(f"✅ Price: {item[1]} → {value}")
-        elif action == "name" and value:
-            await db.execute("UPDATE shop_items SET name=? WHERE guild_id=? AND item_id=?", (value, ctx.guild.id, item_id))
-            await db.commit()
-            await ctx.reply(f"✅ Name: {item[0]} → {value}")
-        else:
-            await ctx.reply("❌ Usage: `!editshop 1 delete` or `!editshop 1 price 500`")
+    item = await get_shop_item(ctx.guild.id, item_id)
+    if not item:
+        return await ctx.reply("❌ Item not found!")
+    action = action.lower()
+    if action == "delete":
+        await delete_shop_item(ctx.guild.id, item_id)
+        await ctx.reply(f"✅ Deleted #{item_id}")
+    elif action == "price" and value:
+        await update_shop_item(ctx.guild.id, item_id, "price", int(value))
+        await ctx.reply(f"✅ Price: {item[1]} → {value}")
+    elif action == "name" and value:
+        await update_shop_item(ctx.guild.id, item_id, "name", value)
+        await ctx.reply(f"✅ Name: {item[0]} → {value}")
+    else:
+        await ctx.reply("❌ Usage: `!editshop 1 delete` or `!editshop 1 price 500`")
 
 @bot.command()
 async def buy(ctx, item_id: int):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT name, price FROM shop_items WHERE guild_id=? AND item_id=?", (ctx.guild.id, item_id))
-        item = await cur.fetchone()
+    item = await get_shop_item(ctx.guild.id, item_id)
     if not item:
         return await ctx.reply("❌ Item not found!")
     name, price = item
@@ -888,9 +1067,7 @@ async def buy(ctx, item_id: int):
     if current < price:
         return await ctx.reply(f"❌ Need {price:,}, you have {current:,}")
     new = await add_coins(ctx.guild.id, ctx.author.id, -price)
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute("INSERT INTO shop_purchases VALUES (NULL,?,?,?,?,datetime('now'))", (ctx.guild.id, ctx.author.id, name, price))
-        await db.commit()
+    await add_purchase(ctx.guild.id, ctx.author.id, name, price)
     await ctx.reply(f"✅ Bought **{name}**! Balance: {new:,}")
     if ctx.guild.owner:
         try: await ctx.guild.owner.send(f"🛒 {ctx.author} bought {name} in {ctx.guild.name}")
@@ -899,9 +1076,7 @@ async def buy(ctx, item_id: int):
 @bot.command()
 async def purchases(ctx, member: discord.Member = None):
     m = member or ctx.author
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT item_name, price FROM shop_purchases WHERE guild_id=? AND user_id=? ORDER BY purchased_at DESC LIMIT 10", (ctx.guild.id, m.id))
-        rows = await cur.fetchall()
+    rows = await get_purchases(ctx.guild.id, m.id)
     if not rows:
         return await ctx.reply(f"📋 {m.name} has no purchases")
     embed = discord.Embed(title=f"📋 {m.name}'s Purchases", color=discord.Color.blue())
@@ -1156,27 +1331,21 @@ async def welcomeimagedelete(ctx, num: int):
 @commands.has_permissions(manage_guild=True)
 async def addcmd(ctx, name: str, *, response: str):
     name = name.lower().strip()
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute("INSERT OR REPLACE INTO custom_commands VALUES (?,?,?)", (ctx.guild.id, name, response))
-        await db.commit()
+    await set_custom_command(ctx.guild.id, name, response)
     await ctx.reply(f"✅ Added `!{name}`")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def delcmd(ctx, name: str):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("DELETE FROM custom_commands WHERE guild_id=? AND name=?", (ctx.guild.id, name.lower()))
-        await db.commit()
-        if cur.rowcount == 0: return await ctx.reply("❌ Not found!")
+    deleted = await delete_custom_command(ctx.guild.id, name.lower())
+    if not deleted: return await ctx.reply("❌ Not found!")
     await ctx.reply(f"✅ Deleted `!{name}`")
 
 @bot.command()
 async def cmdlist(ctx):
-    async with aiosqlite.connect("bot.db") as db:
-        cur = await db.execute("SELECT name FROM custom_commands WHERE guild_id=?", (ctx.guild.id,))
-        rows = await cur.fetchall()
-    if not rows: return await ctx.reply("📋 No custom commands")
-    await ctx.reply("📋 Custom: " + ", ".join(f"`!{r[0]}`" for r in rows))
+    names = await get_custom_commands_list(ctx.guild.id)
+    if not names: return await ctx.reply("📋 No custom commands")
+    await ctx.reply("📋 Custom: " + ", ".join(f"`!{n}`" for n in names))
 
 @bot.command()
 async def shutdown(ctx):
