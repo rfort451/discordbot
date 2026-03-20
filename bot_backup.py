@@ -91,15 +91,6 @@ async def get_channel_setting(guild_id, setting):
         row = await cur.fetchone()
         return row[0] if row else None
 
-async def set_guild_setting(guild_id, setting, value):
-    """Update a single guild setting without wiping others"""
-    async with aiosqlite.connect("bot.db") as db:
-        # First ensure the row exists
-        await db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (guild_id,))
-        # Then update only the specific column
-        await db.execute(f"UPDATE guild_settings SET {setting}=? WHERE guild_id=?", (value, guild_id))
-        await db.commit()
-
 def is_admin(member):
     return member.guild_permissions.manage_guild or member.guild_permissions.administrator
 
@@ -210,8 +201,7 @@ async def help(ctx):
     user_embed = discord.Embed(title="📚 Commands", color=discord.Color.blue())
     user_embed.add_field(name="🎮 Fun", value="`!meme` `!dadjoke` `!jokeoftheday` `!dirtyjoke` `!8ball` `!quote` `!roast`", inline=False)
     user_embed.add_field(name="🎯 Games", value="`!minigame` `!quiz` `!stopquiz` `!pausequiz`", inline=False)
-    user_embed.add_field(name="💰 Economy", value="`!coins` `!gamble` `!slots` `!blackjack` `!coinflip` `!dice` `!roulette`", inline=False)
-    user_embed.add_field(name="🎲 More Games", value="`!treasurehunt` `!heist` `!crime` `!boss`", inline=False)
+    user_embed.add_field(name="💰 Economy", value="`!coins` `!gamble` `!treasurehunt` `!heist` `!crime` `!boss`", inline=False)
     user_embed.add_field(name="🛒 Shop", value="`!shop` `!buy` `!purchases`", inline=False)
     user_embed.add_field(name="👋 Greetings", value="`!gm` `!gn` `!ga` `!render`", inline=False)
     user_embed.add_field(name="ℹ️ Info", value="`!ping` `!serverinfo` `!userinfo` `!avatar`", inline=False)
@@ -334,7 +324,9 @@ async def avatar(ctx, member: discord.Member = None):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def thischannelminigame(ctx):
-    await set_guild_setting(ctx.guild.id, "minigame_channel_id", ctx.channel.id)
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("INSERT OR REPLACE INTO guild_settings (guild_id, minigame_channel_id) VALUES (?,?)", (ctx.guild.id, ctx.channel.id))
+        await db.commit()
     await ctx.reply(f"✅ Minigame channel set!")
 
 @bot.command()
@@ -469,28 +461,34 @@ async def editcoins(ctx, member: discord.Member, amount: str):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def thischannelgamble(ctx):
-    await set_guild_setting(ctx.guild.id, "gambling_channel_id", ctx.channel.id)
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("INSERT OR REPLACE INTO guild_settings (guild_id, gambling_channel_id) VALUES (?,?)", (ctx.guild.id, ctx.channel.id))
+        await db.commit()
     await ctx.reply(f"🎰 Gambling channel set!")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def thischannelreaction(ctx, *emotes):
     if not emotes:
-        return await ctx.reply("❌ Usage: `!thischannelreaction 😀 🎉 👍 ...` (add as many emotes as you want!)")
-    # Store emotes as-is (works for unicode and custom emotes)
+        return await ctx.reply("❌ Usage: `!thischannelreaction 😀 🎉 👍`")
     emote_str = ",".join(emotes)
-    await set_guild_setting(ctx.guild.id, "reaction_channel_id", ctx.channel.id)
-    await set_guild_setting(ctx.guild.id, "reaction_emotes", emote_str)
-    await ctx.reply(f"✅ Reaction channel set! Will react with {len(emotes)} emote(s): {' '.join(emotes)}")
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("""INSERT INTO guild_settings (guild_id, reaction_channel_id, reaction_emotes) VALUES (?,?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET reaction_channel_id=?, reaction_emotes=?""", 
+            (ctx.guild.id, ctx.channel.id, emote_str, ctx.channel.id, emote_str))
+        await db.commit()
+    await ctx.reply(f"✅ Reaction channel set! Will react with: {' '.join(emotes)}")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def editchannelreaction(ctx, *emotes):
     if not emotes:
-        return await ctx.reply("❌ Usage: `!editchannelreaction 😀 🎉 👍 ...` (add as many emotes as you want!)")
+        return await ctx.reply("❌ Usage: `!editchannelreaction 😀 🎉 👍`")
     emote_str = ",".join(emotes)
-    await set_guild_setting(ctx.guild.id, "reaction_emotes", emote_str)
-    await ctx.reply(f"✅ Reactions updated to {len(emotes)} emote(s): {' '.join(emotes)}")
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("UPDATE guild_settings SET reaction_emotes=? WHERE guild_id=?", (emote_str, ctx.guild.id))
+        await db.commit()
+    await ctx.reply(f"✅ Reactions updated to: {' '.join(emotes)}")
 
 async def check_gamble_channel(ctx):
     ch = await get_channel_setting(ctx.guild.id, "gambling_channel_id")
@@ -564,238 +562,6 @@ async def crime(ctx):
     reward = random.randint(0, 100)
     new = await add_coins(ctx.guild.id, ctx.author.id, reward)
     await ctx.reply(f"🔪 Got {reward} coins! (Profit: {reward-cost:+}) Balance: {new:,}")
-
-# ==================== CASINO GAMES ====================
-@bot.command()
-async def slots(ctx, bet: int = None):
-    ok, ch = await check_gamble_channel(ctx)
-    if not ok:
-        if not ch: return await ctx.reply("❌ Gambling not set up! Admin: `!thischannelgamble`")
-        return await ctx.reply(f"❌ Use in <#{ch}>!")
-    if not bet or bet < 10: return await ctx.reply("❌ Min bet: 10 coins")
-    current = await get_coins(ctx.guild.id, ctx.author.id)
-    if current < bet: return await ctx.reply(f"❌ You have {current:,} coins")
-    
-    symbols = ["🍒", "🍋", "🍊", "🍇", "💎", "7️⃣", "🔔"]
-    weights = [30, 25, 20, 15, 5, 3, 2]
-    reels = [random.choices(symbols, weights)[0] for _ in range(3)]
-    
-    if reels[0] == reels[1] == reels[2]:
-        if reels[0] == "7️⃣": mult = 10
-        elif reels[0] == "💎": mult = 7
-        elif reels[0] == "🔔": mult = 5
-        else: mult = 3
-        winnings = bet * mult
-        result = f"🎰 **JACKPOT!** x{mult}"
-        color = discord.Color.gold()
-    elif reels[0] == reels[1] or reels[1] == reels[2]:
-        winnings = bet
-        result = "🎰 Two match! x1"
-        color = discord.Color.green()
-    else:
-        winnings = -bet
-        result = "🎰 No match..."
-        color = discord.Color.red()
-    
-    new = await add_coins(ctx.guild.id, ctx.author.id, winnings)
-    embed = discord.Embed(title=f"[ {reels[0]} | {reels[1]} | {reels[2]} ]", description=f"{result}\n{'+' if winnings > 0 else ''}{winnings:,} coins\nBalance: {new:,}", color=color)
-    await ctx.reply(embed=embed)
-
-@bot.command()
-async def coinflip(ctx, choice: str = None, bet: int = None):
-    ok, ch = await check_gamble_channel(ctx)
-    if not ok:
-        if not ch: return await ctx.reply("❌ Gambling not set up! Admin: `!thischannelgamble`")
-        return await ctx.reply(f"❌ Use in <#{ch}>!")
-    if not choice or choice.lower() not in ["heads", "tails", "h", "t"]:
-        return await ctx.reply("❌ Usage: `!coinflip heads 100` or `!coinflip tails 100`")
-    if not bet or bet < 1: return await ctx.reply("❌ Enter a bet amount!")
-    current = await get_coins(ctx.guild.id, ctx.author.id)
-    if current < bet: return await ctx.reply(f"❌ You have {current:,} coins")
-    
-    choice = "heads" if choice.lower() in ["heads", "h"] else "tails"
-    result = random.choice(["heads", "tails"])
-    won = choice == result
-    emoji = "🪙" if result == "heads" else "⭕"
-    
-    new = await add_coins(ctx.guild.id, ctx.author.id, bet if won else -bet)
-    embed = discord.Embed(
-        title=f"{emoji} {result.upper()}!",
-        description=f"You chose: {choice}\n{'✅ WON' if won else '❌ LOST'} {bet:,} coins\nBalance: {new:,}",
-        color=discord.Color.green() if won else discord.Color.red()
-    )
-    await ctx.reply(embed=embed)
-
-@bot.command()
-async def dice(ctx, bet: int = None):
-    ok, ch = await check_gamble_channel(ctx)
-    if not ok:
-        if not ch: return await ctx.reply("❌ Gambling not set up! Admin: `!thischannelgamble`")
-        return await ctx.reply(f"❌ Use in <#{ch}>!")
-    if not bet or bet < 10: return await ctx.reply("❌ Min bet: 10 coins")
-    current = await get_coins(ctx.guild.id, ctx.author.id)
-    if current < bet: return await ctx.reply(f"❌ You have {current:,} coins")
-    
-    player = [random.randint(1, 6), random.randint(1, 6)]
-    dealer = [random.randint(1, 6), random.randint(1, 6)]
-    p_total, d_total = sum(player), sum(dealer)
-    
-    dice_emoji = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]
-    p_str = f"{dice_emoji[player[0]-1]} {dice_emoji[player[1]-1]} = {p_total}"
-    d_str = f"{dice_emoji[dealer[0]-1]} {dice_emoji[dealer[1]-1]} = {d_total}"
-    
-    if p_total > d_total:
-        winnings = bet
-        result = "🎲 You WIN!"
-        color = discord.Color.green()
-    elif p_total < d_total:
-        winnings = -bet
-        result = "🎲 Dealer wins..."
-        color = discord.Color.red()
-    else:
-        winnings = 0
-        result = "🎲 TIE! Bet returned"
-        color = discord.Color.gold()
-    
-    new = await add_coins(ctx.guild.id, ctx.author.id, winnings)
-    embed = discord.Embed(title=result, color=color)
-    embed.add_field(name="Your Roll", value=p_str, inline=True)
-    embed.add_field(name="Dealer Roll", value=d_str, inline=True)
-    embed.add_field(name="Result", value=f"{'+' if winnings > 0 else ''}{winnings:,} coins\nBalance: {new:,}", inline=False)
-    await ctx.reply(embed=embed)
-
-@bot.command()
-async def roulette(ctx, choice: str = None, bet: int = None):
-    ok, ch = await check_gamble_channel(ctx)
-    if not ok:
-        if not ch: return await ctx.reply("❌ Gambling not set up! Admin: `!thischannelgamble`")
-        return await ctx.reply(f"❌ Use in <#{ch}>!")
-    if not choice: return await ctx.reply("❌ Usage: `!roulette red 100`, `!roulette black 100`, `!roulette 7 100`")
-    if not bet or bet < 10: return await ctx.reply("❌ Min bet: 10 coins")
-    current = await get_coins(ctx.guild.id, ctx.author.id)
-    if current < bet: return await ctx.reply(f"❌ You have {current:,} coins")
-    
-    choice = choice.lower()
-    number = random.randint(0, 36)
-    red_nums = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
-    color = "🟢" if number == 0 else ("🔴" if number in red_nums else "⚫")
-    color_name = "green" if number == 0 else ("red" if number in red_nums else "black")
-    
-    winnings = 0
-    if choice.isdigit() and int(choice) == number:
-        winnings = bet * 35
-        result = f"🎯 NUMBER {number}! x35"
-    elif choice == color_name:
-        winnings = bet * 2 if choice != "green" else bet * 35
-        result = f"✅ {color_name.upper()}! x{'2' if choice != 'green' else '35'}"
-    elif choice in ["red", "black", "green"] or choice.isdigit():
-        winnings = -bet
-        result = "❌ Wrong!"
-    else:
-        return await ctx.reply("❌ Choose: red, black, green, or a number 0-36")
-    
-    new = await add_coins(ctx.guild.id, ctx.author.id, winnings)
-    embed = discord.Embed(title=f"{color} {number}", description=f"{result}\n{'+' if winnings > 0 else ''}{winnings:,} coins\nBalance: {new:,}", color=discord.Color.gold())
-    await ctx.reply(embed=embed)
-
-@bot.command()
-async def blackjack(ctx, bet: int = None):
-    ok, ch = await check_gamble_channel(ctx)
-    if not ok:
-        if not ch: return await ctx.reply("❌ Gambling not set up! Admin: `!thischannelgamble`")
-        return await ctx.reply(f"❌ Use in <#{ch}>!")
-    if not bet or bet < 10: return await ctx.reply("❌ Min bet: 10 coins")
-    current = await get_coins(ctx.guild.id, ctx.author.id)
-    if current < bet: return await ctx.reply(f"❌ You have {current:,} coins")
-    if ctx.author.id in active_games: return await ctx.reply("❌ Finish your current game!")
-    
-    suits = ["♠️", "♥️", "♦️", "♣️"]
-    ranks = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-    deck = [(r, s) for s in suits for r in ranks]
-    random.shuffle(deck)
-    
-    def card_value(hand):
-        val, aces = 0, 0
-        for r, s in hand:
-            if r in ["J", "Q", "K"]: val += 10
-            elif r == "A": val += 11; aces += 1
-            else: val += int(r)
-        while val > 21 and aces: val -= 10; aces -= 1
-        return val
-    
-    def hand_str(hand): return " ".join([f"{r}{s}" for r, s in hand])
-    
-    player = [deck.pop(), deck.pop()]
-    dealer = [deck.pop(), deck.pop()]
-    active_games[ctx.author.id] = {"deck": deck, "player": player, "dealer": dealer, "bet": bet}
-    
-    p_val = card_value(player)
-    if p_val == 21:
-        del active_games[ctx.author.id]
-        winnings = int(bet * 1.5)
-        new = await add_coins(ctx.guild.id, ctx.author.id, winnings)
-        embed = discord.Embed(title="🃏 BLACKJACK!", color=discord.Color.gold())
-        embed.add_field(name="Your Hand", value=f"{hand_str(player)} ({p_val})", inline=False)
-        embed.add_field(name="Winnings", value=f"+{winnings:,} coins\nBalance: {new:,}", inline=False)
-        return await ctx.reply(embed=embed)
-    
-    embed = discord.Embed(title="🃏 Blackjack", color=discord.Color.blue())
-    embed.add_field(name="Your Hand", value=f"{hand_str(player)} ({p_val})", inline=False)
-    embed.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=False)
-    embed.set_footer(text="Type 'hit' or 'stand'")
-    await ctx.reply(embed=embed)
-    
-    def check(m): return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ["hit", "stand", "h", "s"]
-    
-    while True:
-        try:
-            msg = await bot.wait_for("message", check=check, timeout=60)
-            game = active_games.get(ctx.author.id)
-            if not game: return
-            
-            if msg.content.lower() in ["hit", "h"]:
-                game["player"].append(game["deck"].pop())
-                p_val = card_value(game["player"])
-                if p_val > 21:
-                    del active_games[ctx.author.id]
-                    new = await add_coins(ctx.guild.id, ctx.author.id, -bet)
-                    embed = discord.Embed(title="💥 BUST!", color=discord.Color.red())
-                    embed.add_field(name="Your Hand", value=f"{hand_str(game['player'])} ({p_val})", inline=False)
-                    embed.add_field(name="Lost", value=f"-{bet:,} coins\nBalance: {new:,}", inline=False)
-                    return await ctx.reply(embed=embed)
-                embed = discord.Embed(title="🃏 Blackjack", color=discord.Color.blue())
-                embed.add_field(name="Your Hand", value=f"{hand_str(game['player'])} ({p_val})", inline=False)
-                embed.add_field(name="Dealer Shows", value=f"{dealer[0][0]}{dealer[0][1]} ??", inline=False)
-                embed.set_footer(text="Type 'hit' or 'stand'")
-                await ctx.reply(embed=embed)
-            else:
-                del active_games[ctx.author.id]
-                d_val = card_value(game["dealer"])
-                while d_val < 17:
-                    game["dealer"].append(game["deck"].pop())
-                    d_val = card_value(game["dealer"])
-                
-                p_val = card_value(game["player"])
-                if d_val > 21 or p_val > d_val:
-                    winnings = bet
-                    title, color = "🎉 YOU WIN!", discord.Color.green()
-                elif p_val < d_val:
-                    winnings = -bet
-                    title, color = "😢 Dealer Wins", discord.Color.red()
-                else:
-                    winnings = 0
-                    title, color = "🤝 Push (Tie)", discord.Color.gold()
-                
-                new = await add_coins(ctx.guild.id, ctx.author.id, winnings)
-                embed = discord.Embed(title=title, color=color)
-                embed.add_field(name="Your Hand", value=f"{hand_str(game['player'])} ({p_val})", inline=True)
-                embed.add_field(name="Dealer Hand", value=f"{hand_str(game['dealer'])} ({d_val})", inline=True)
-                embed.add_field(name="Result", value=f"{'+' if winnings > 0 else ''}{winnings:,} coins\nBalance: {new:,}", inline=False)
-                return await ctx.reply(embed=embed)
-        except asyncio.TimeoutError:
-            if ctx.author.id in active_games: del active_games[ctx.author.id]
-            new = await add_coins(ctx.guild.id, ctx.author.id, -bet)
-            return await ctx.reply(f"⏰ Timed out! Lost {bet:,} coins. Balance: {new:,}")
 
 @bot.command()
 async def boss(ctx):
@@ -1015,7 +781,9 @@ async def render(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def thischannelwelcome(ctx):
-    await set_guild_setting(ctx.guild.id, "welcome_channel_id", ctx.channel.id)
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("INSERT OR REPLACE INTO guild_settings (guild_id, welcome_channel_id) VALUES (?,?)", (ctx.guild.id, ctx.channel.id))
+        await db.commit()
     await ctx.reply(f"✅ Welcome channel set!")
 
 @bot.command()
