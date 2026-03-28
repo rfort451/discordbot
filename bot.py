@@ -49,11 +49,6 @@ message_cooldowns = {}
 daily_render = {}
 db_pool = None  # PostgreSQL connection pool
 
-# Image directories
-BASE_PATH = os.path.join(os.path.dirname(__file__), "images")
-for pool in ["gm", "gn", "ga", "render", "welcome"]:
-    os.makedirs(os.path.join(BASE_PATH, pool), exist_ok=True)
-
 # ==================== DATABASE ====================
 USE_POSTGRES = bool(DATABASE_URL and HAS_ASYNCPG)
 
@@ -75,6 +70,8 @@ async def init_db():
                 (guild_id BIGINT, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
             await conn.execute("""CREATE TABLE IF NOT EXISTS daily_claims 
                 (guild_id BIGINT, user_id BIGINT, last_claim TIMESTAMP, PRIMARY KEY (guild_id, user_id))""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS image_pools 
+                (id SERIAL PRIMARY KEY, pool_name TEXT NOT NULL, filename TEXT NOT NULL, image_data BYTEA NOT NULL, content_type TEXT DEFAULT 'image/png')""")
     else:
         print("📦 Using SQLite (local)")
         async with aiosqlite.connect("bot.db") as db:
@@ -90,6 +87,8 @@ async def init_db():
                 (guild_id INTEGER, name TEXT, response TEXT, PRIMARY KEY (guild_id, name))""")
             await db.execute("""CREATE TABLE IF NOT EXISTS daily_claims 
                 (guild_id INTEGER, user_id INTEGER, last_claim TIMESTAMP, PRIMARY KEY (guild_id, user_id))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS image_pools 
+                (id INTEGER PRIMARY KEY AUTOINCREMENT, pool_name TEXT NOT NULL, filename TEXT NOT NULL, image_data BLOB NOT NULL, content_type TEXT DEFAULT 'image/png')""")
             await db.commit()
 
 # ==================== HELPERS ====================
@@ -331,30 +330,58 @@ async def set_daily_claim(guild_id, user_id):
 def is_admin(member):
     return member.guild_permissions.manage_guild or member.guild_permissions.administrator
 
-def get_pool_images(pool_name):
-    pool_path = os.path.join(BASE_PATH, pool_name)
-    if not os.path.exists(pool_path):
-        return []
-    return sorted([f for f in os.listdir(pool_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp'))])
+async def get_pool_images(pool_name):
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, filename FROM image_pools WHERE pool_name=$1 ORDER BY id", pool_name)
+            return [(row['id'], row['filename']) for row in rows]
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT id, filename FROM image_pools WHERE pool_name=? ORDER BY id", (pool_name,))
+            return await cur.fetchall()
 
-def get_random_image(pool_name):
-    images = get_pool_images(pool_name)
+async def get_random_image(pool_name):
+    images = await get_pool_images(pool_name)
     if not images:
-        return None
-    img_path = os.path.join(BASE_PATH, pool_name, random.choice(images))
-    with open(img_path, 'rb') as f:
-        return BytesIO(f.read())
+        return None, None
+    img_id, filename = random.choice(images)
+    ext = filename.rsplit('.', 1)[-1] if '.' in filename else 'png'
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT image_data FROM image_pools WHERE id=$1", img_id)
+            return BytesIO(row['image_data']), ext
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            cur = await db.execute("SELECT image_data FROM image_pools WHERE id=?", (img_id,))
+            row = await cur.fetchone()
+            return BytesIO(row[0]), ext
 
 async def save_image(attachment, pool_name):
     if not attachment.content_type or not attachment.content_type.startswith("image/"):
         return False, "Not an image!"
-    pool_path = os.path.join(BASE_PATH, pool_name)
-    count = len(get_pool_images(pool_name)) + 1
+    image_data = await attachment.read()
     ext = attachment.filename.split('.')[-1] or 'png'
+    count = len(await get_pool_images(pool_name)) + 1
     filename = f"{pool_name}_{count}.{ext}"
-    filepath = os.path.join(pool_path, filename)
-    await attachment.save(filepath)
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("INSERT INTO image_pools (pool_name, filename, image_data, content_type) VALUES ($1, $2, $3, $4)",
+                pool_name, filename, image_data, attachment.content_type or 'image/png')
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("INSERT INTO image_pools (pool_name, filename, image_data, content_type) VALUES (?,?,?,?)",
+                (pool_name, filename, image_data, attachment.content_type or 'image/png'))
+            await db.commit()
     return True, filename
+
+async def delete_pool_image(image_id):
+    if USE_POSTGRES:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM image_pools WHERE id=$1", image_id)
+    else:
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("DELETE FROM image_pools WHERE id=?", (image_id,))
+            await db.commit()
 
 # ==================== EVENTS ====================
 @bot.event
@@ -420,10 +447,10 @@ async def on_member_join(member):
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     
-    img = get_random_image("welcome")
+    img, ext = await get_random_image("welcome")
     if img:
-        file = discord.File(img, "welcome.png")
-        embed.set_image(url="attachment://welcome.png")
+        file = discord.File(img, f"welcome.{ext}")
+        embed.set_image(url=f"attachment://welcome.{ext}")
         await channel.send(file=file, embed=embed)
     else:
         await channel.send(embed=embed)
@@ -1209,25 +1236,25 @@ async def modlogs(ctx):
 # ==================== GREETINGS ====================
 @bot.command()
 async def gm(ctx):
-    img = get_random_image("gm")
+    img, ext = await get_random_image("gm")
     if img:
-        await ctx.send(file=discord.File(img, "gm.png"))
+        await ctx.send(file=discord.File(img, f"gm.{ext}"))
     else:
         await ctx.reply("☀️ Good morning!")
 
 @bot.command()
 async def gn(ctx):
-    img = get_random_image("gn")
+    img, ext = await get_random_image("gn")
     if img:
-        await ctx.send(file=discord.File(img, "gn.png"))
+        await ctx.send(file=discord.File(img, f"gn.{ext}"))
     else:
         await ctx.reply("🌙 Good night!")
 
 @bot.command()
 async def ga(ctx):
-    img = get_random_image("ga")
+    img, ext = await get_random_image("ga")
     if img:
-        await ctx.send(file=discord.File(img, "ga.png"))
+        await ctx.send(file=discord.File(img, f"ga.{ext}"))
     else:
         await ctx.reply("🌤️ Good afternoon!")
 
@@ -1236,10 +1263,10 @@ async def render(ctx):
     today = datetime.now().date()
     if ctx.author.id in daily_render and daily_render[ctx.author.id] == today:
         return await ctx.reply("❌ Already got render today!")
-    img = get_random_image("render")
+    img, ext = await get_random_image("render")
     if img:
         daily_render[ctx.author.id] = today
-        await ctx.send(file=discord.File(img, "render.png"))
+        await ctx.send(file=discord.File(img, f"render.{ext}"))
     else:
         await ctx.reply("❌ No renders! Admin: `!renderimage`")
 
@@ -1260,10 +1287,10 @@ async def testwelcome(ctx, member: discord.Member = None):
         color=discord.Color.green()
     )
     embed.set_thumbnail(url=m.display_avatar.url)
-    img = get_random_image("welcome")
+    img, ext = await get_random_image("welcome")
     if img:
-        file = discord.File(img, "welcome.png")
-        embed.set_image(url="attachment://welcome.png")
+        file = discord.File(img, f"welcome.{ext}")
+        embed.set_image(url=f"attachment://welcome.{ext}")
         await ctx.send(file=file, embed=embed)
     else:
         await ctx.send(embed=embed)
@@ -1279,16 +1306,16 @@ async def gmimage(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gmimagelist(ctx):
-    images = get_pool_images("gm")
+    images = await get_pool_images("gm")
     if not images: return await ctx.reply("📋 No GM images")
-    await ctx.reply("☀️ GM Images:\n" + "\n".join(f"#{i}: {img}" for i, img in enumerate(images, 1)))
+    await ctx.reply("☀️ GM Images:\n" + "\n".join(f"#{i}: {fn}" for i, (_, fn) in enumerate(images, 1)))
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gmimagedelete(ctx, num: int):
-    images = get_pool_images("gm")
+    images = await get_pool_images("gm")
     if not images or num < 1 or num > len(images): return await ctx.reply(f"❌ Invalid! Use 1-{len(images)}")
-    os.remove(os.path.join(BASE_PATH, "gm", images[num-1]))
+    await delete_pool_image(images[num-1][0])
     await ctx.reply(f"✅ Deleted #{num}")
 
 # GN images
@@ -1302,16 +1329,16 @@ async def gnimage(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gnimagelist(ctx):
-    images = get_pool_images("gn")
+    images = await get_pool_images("gn")
     if not images: return await ctx.reply("📋 No GN images")
-    await ctx.reply("🌙 GN Images:\n" + "\n".join(f"#{i}: {img}" for i, img in enumerate(images, 1)))
+    await ctx.reply("🌙 GN Images:\n" + "\n".join(f"#{i}: {fn}" for i, (_, fn) in enumerate(images, 1)))
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gnimagedelete(ctx, num: int):
-    images = get_pool_images("gn")
+    images = await get_pool_images("gn")
     if not images or num < 1 or num > len(images): return await ctx.reply(f"❌ Invalid! Use 1-{len(images)}")
-    os.remove(os.path.join(BASE_PATH, "gn", images[num-1]))
+    await delete_pool_image(images[num-1][0])
     await ctx.reply(f"✅ Deleted #{num}")
 
 # GA images
@@ -1325,16 +1352,16 @@ async def gaimage(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gaimagelist(ctx):
-    images = get_pool_images("ga")
+    images = await get_pool_images("ga")
     if not images: return await ctx.reply("📋 No GA images")
-    await ctx.reply("🌤️ GA Images:\n" + "\n".join(f"#{i}: {img}" for i, img in enumerate(images, 1)))
+    await ctx.reply("🌤️ GA Images:\n" + "\n".join(f"#{i}: {fn}" for i, (_, fn) in enumerate(images, 1)))
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def gaimagedelete(ctx, num: int):
-    images = get_pool_images("ga")
+    images = await get_pool_images("ga")
     if not images or num < 1 or num > len(images): return await ctx.reply(f"❌ Invalid! Use 1-{len(images)}")
-    os.remove(os.path.join(BASE_PATH, "ga", images[num-1]))
+    await delete_pool_image(images[num-1][0])
     await ctx.reply(f"✅ Deleted #{num}")
 
 # Render images
@@ -1348,16 +1375,16 @@ async def renderimage(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def renderimagelist(ctx):
-    images = get_pool_images("render")
+    images = await get_pool_images("render")
     if not images: return await ctx.reply("📋 No render images")
-    await ctx.reply("🎨 Render Images:\n" + "\n".join(f"#{i}: {img}" for i, img in enumerate(images, 1)))
+    await ctx.reply("🎨 Render Images:\n" + "\n".join(f"#{i}: {fn}" for i, (_, fn) in enumerate(images, 1)))
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def renderimagedelete(ctx, num: int):
-    images = get_pool_images("render")
+    images = await get_pool_images("render")
     if not images or num < 1 or num > len(images): return await ctx.reply(f"❌ Invalid! Use 1-{len(images)}")
-    os.remove(os.path.join(BASE_PATH, "render", images[num-1]))
+    await delete_pool_image(images[num-1][0])
     await ctx.reply(f"✅ Deleted #{num}")
 
 # Welcome images
@@ -1371,16 +1398,16 @@ async def welcomeimage(ctx):
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def welcomeimagelist(ctx):
-    images = get_pool_images("welcome")
+    images = await get_pool_images("welcome")
     if not images: return await ctx.reply("📋 No welcome images")
-    await ctx.reply("🎉 Welcome Images:\n" + "\n".join(f"#{i}: {img}" for i, img in enumerate(images, 1)))
+    await ctx.reply("🎉 Welcome Images:\n" + "\n".join(f"#{i}: {fn}" for i, (_, fn) in enumerate(images, 1)))
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
 async def welcomeimagedelete(ctx, num: int):
-    images = get_pool_images("welcome")
+    images = await get_pool_images("welcome")
     if not images or num < 1 or num > len(images): return await ctx.reply(f"❌ Invalid! Use 1-{len(images)}")
-    os.remove(os.path.join(BASE_PATH, "welcome", images[num-1]))
+    await delete_pool_image(images[num-1][0])
     await ctx.reply(f"✅ Deleted #{num}")
 
 # ==================== CUSTOM COMMANDS ====================
